@@ -34,7 +34,6 @@ import jakarta.persistence.criteria.Join;
 import jakarta.persistence.criteria.JoinType;
 import jakarta.persistence.criteria.Nulls;
 import jakarta.persistence.criteria.Path;
-import jakarta.persistence.criteria.Nulls;
 import jakarta.persistence.criteria.Root;
 import jakarta.persistence.spi.PersistenceProvider;
 import jakarta.persistence.spi.PersistenceProviderResolver;
@@ -46,6 +45,10 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import org.hibernate.annotations.Any;
+import org.hibernate.annotations.AnyDiscriminator;
+import org.hibernate.annotations.AnyDiscriminatorValue;
+import org.hibernate.annotations.AnyKeyJavaClass;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mockito;
@@ -56,6 +59,8 @@ import org.springframework.data.jpa.domain.sample.Category;
 import org.springframework.data.jpa.domain.sample.Invoice;
 import org.springframework.data.jpa.domain.sample.InvoiceItem;
 import org.springframework.data.jpa.domain.sample.Order;
+import org.springframework.data.jpa.domain.sample.ReferencingEmbeddedIdExampleEmployee;
+import org.springframework.data.jpa.domain.sample.ReferencingIdClassExampleEmployee;
 import org.springframework.data.jpa.domain.sample.User;
 import org.springframework.data.jpa.infrastructure.HibernateTestUtils;
 import org.springframework.data.mapping.PropertyPath;
@@ -71,6 +76,8 @@ import org.springframework.test.context.junit.jupiter.SpringExtension;
  * @author Patrice Blanchardie
  * @author Diego Krupitza
  * @author Krzysztof Krason
+ * @author Jakub Soltys
+ * @author Hyunjoon Park
  */
 @ExtendWith(SpringExtension.class)
 @ContextConfiguration("classpath:infrastructure.xml")
@@ -370,6 +377,36 @@ class QueryUtilsIntegrationTests {
 		}
 	}
 
+	@Test // GH-2318
+	void handlesHibernateAnyAnnotationWithoutThrowingException() {
+
+		doInMerchantContext((emf) -> {
+
+			CriteriaBuilder builder = emf.createEntityManager().getCriteriaBuilder();
+			CriteriaQuery<EntityWithAny> query = builder.createQuery(EntityWithAny.class);
+			Root<EntityWithAny> root = query.from(EntityWithAny.class);
+
+			// This would throw IllegalArgumentException without the fix
+			PropertyPath monitorObjectPath = PropertyPath.from("monitorObject", EntityWithAny.class);
+			assertThatNoException().isThrownBy(() -> QueryUtils.toExpressionRecursively(root, monitorObjectPath));
+		});
+	}
+
+	@Test // GH-2318
+	void doesNotCreateJoinForAnyAnnotatedProperty() {
+
+		doInMerchantContext((emf) -> {
+
+			CriteriaBuilder builder = emf.createEntityManager().getCriteriaBuilder();
+			CriteriaQuery<EntityWithAny> query = builder.createQuery(EntityWithAny.class);
+			Root<EntityWithAny> root = query.from(EntityWithAny.class);
+
+			QueryUtils.toExpressionRecursively(root, PropertyPath.from("monitorObject", EntityWithAny.class));
+
+			assertThat(root.getJoins()).isEmpty();
+		});
+	}
+
 	/**
 	 * This test documents an ambiguity in the JPA spec (or it's implementation in Hibernate vs EclipseLink) that we have
 	 * to work around in the test {@link #doesNotCreateJoinForOptionalAssociationWithoutFurtherNavigation()}. See also:
@@ -385,6 +422,45 @@ class QueryUtilsIntegrationTests {
 		root.get("manager");
 
 		assertThat(root.getJoins()).hasSize(getNumberOfJoinsAfterCreatingAPath());
+	}
+
+	@Test // GH-3349
+	void doesNotCreateJoinForRelationshipSimpleId() {
+
+		CriteriaBuilder builder = em.getCriteriaBuilder();
+		CriteriaQuery<User> query = builder.createQuery(User.class);
+		Root<User> from = query.from(User.class);
+
+		QueryUtils.toExpressionRecursively(from, PropertyPath.from("manager.id", User.class));
+
+		assertThat(from.getFetches()).isEmpty();
+		assertThat(from.getJoins()).isEmpty();
+	}
+
+	@Test // GH-3349
+	void doesNotCreateJoinForRelationshipEmbeddedId() {
+
+		CriteriaBuilder builder = em.getCriteriaBuilder();
+		CriteriaQuery<ReferencingEmbeddedIdExampleEmployee> query = builder.createQuery(ReferencingEmbeddedIdExampleEmployee.class);
+		Root<ReferencingEmbeddedIdExampleEmployee> from = query.from(ReferencingEmbeddedIdExampleEmployee.class);
+
+		QueryUtils.toExpressionRecursively(from, PropertyPath.from("employee.employeePk.employeeId", ReferencingEmbeddedIdExampleEmployee.class));
+
+		assertThat(from.getFetches()).isEmpty();
+		assertThat(from.getJoins()).isEmpty();
+	}
+
+	@Test // GH-3349
+	void doesNotCreateJoinForRelationshipIdClass() {
+
+		CriteriaBuilder builder = em.getCriteriaBuilder();
+		CriteriaQuery<ReferencingIdClassExampleEmployee> query = builder.createQuery(ReferencingIdClassExampleEmployee.class);
+		Root<ReferencingIdClassExampleEmployee> from = query.from(ReferencingIdClassExampleEmployee.class);
+
+		QueryUtils.toExpressionRecursively(from, PropertyPath.from("employee.empId", ReferencingIdClassExampleEmployee.class));
+
+		assertThat(from.getFetches()).isEmpty();
+		assertThat(from.getJoins()).isEmpty();
 	}
 
 	int getNumberOfJoinsAfterCreatingAPath() {
@@ -432,6 +508,38 @@ class QueryUtilsIntegrationTests {
 
 		@Id String id;
 		String uid;
+	}
+
+	@Entity
+	@SuppressWarnings("unused")
+	static class EntityWithAny {
+
+		@Id String id;
+
+		@Any
+		@AnyDiscriminator // Default is STRING type
+		@AnyDiscriminatorValue(discriminator = "monitorable", entity = MonitorableEntity.class)
+		@AnyDiscriminatorValue(discriminator = "another", entity = AnotherMonitorableEntity.class)
+		@AnyKeyJavaClass(String.class)
+		@jakarta.persistence.JoinColumn(name = "monitor_object_id")
+		@jakarta.persistence.Column(name = "monitor_object_type")
+		Object monitorObject;
+	}
+
+	@Entity
+	@SuppressWarnings("unused")
+	static class MonitorableEntity {
+
+		@Id String id;
+		String name;
+	}
+
+	@Entity
+	@SuppressWarnings("unused")
+	static class AnotherMonitorableEntity {
+
+		@Id String id;
+		String code;
 	}
 
 	/**
